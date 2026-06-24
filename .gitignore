@@ -1,0 +1,29 @@
+# Secret key files — NEVER commit these
+# If these are pushed to GitHub your cryptographic keys are permanently exposed
+.env
+.env.tx
+.env.rx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+.venv/
+ENV/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
