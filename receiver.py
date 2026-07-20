@@ -325,26 +325,26 @@ def _handle_authenticated_session(conn, addr, args, limiter):
         tx_counter = matched_counter + 1
         save_persisted_counter(tx_device_id_str, tx_counter)
 
-        # -- FHSS channel verification ----------------------------------
-        _, expected_freq_idx = fhss_for_index(keys["fhss"], args.frequencies, fhss_index)
+        # ── ② FHSS channel verification ──────────────────────────────────
+        _, expected_freq_idx = fhss_for_index(keys["fhss"], args.frequencies, hop_idx)
 
-        if freq_index != expected_freq_idx or hop_idx != fhss_index:
+        if freq_index != expected_freq_idx:
             logging.warning(
-                "FHSS mismatch | expected hop=%d freq_idx=%d | got hop=%d freq_idx=%d",
-                fhss_index, expected_freq_idx, hop_idx, freq_index,
+                "FHSS mismatch | expected freq_idx=%d | got freq_idx=%d for hop=%d",
+                expected_freq_idx, freq_index, hop_idx,
             )
             send_framed(conn, b"LOCKED")
             attempts += 1
-            fhss_index += 1
             continue
 
-        # -- All checks passed -> UNLOCK -----------------------------------
+        # ── All checks passed → UNLOCK ───────────────────────────────────
         logging.info(
-            "CAR UNLOCKED | device=%s | hop=%d | counter=%d",
+            "🔓 CAR UNLOCKED | device=%s | hop=%d | counter=%d",
             tx_device_id_str,
-            fhss_index,
+            hop_idx,
             matched_counter,
         )
+
         send_framed(conn, b"UNLOCKED")
         return
 
