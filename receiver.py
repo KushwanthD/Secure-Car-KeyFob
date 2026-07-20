@@ -4,7 +4,8 @@ receiver.py - Key-fob receiver (RX / car side).
 Improvements applied vs original:
   1. Certificate validation  : RX verifies TX's Ed25519 signature before trusting its X25519 pub;
                                RX also signs its own pub so TX can verify.
-  2. Rate limiting           : Per-IP token bucket; sends RATE_LIMITED so TX knows to back off.
+  2. Rate limiting (Failure) : ONLY triggers after 5 failed authentication attempts from an IP.
+                               A successful unlock/lock attempt resets the failure count to 0.
   3. Key rotation            : Session keys incorporate the same daily epoch as TX.
   4. Device attestation      : RX verifies TX attestation and sends its own.
   5. Rolling code verified   : Receiver now actually checks the rolling code value.
@@ -46,7 +47,6 @@ from common_fix import (
     get_device_id,
     sign_attestation,
     verify_attestation,
-    get_rate_limiter,
     send_framed,
     recv_framed,
     get_hop_epoch,
@@ -64,6 +64,41 @@ STATE_FILE = "receiver_state.json"
 state_lock = threading.Lock()
 seen_nonces = set()
 seen_nonces_lock = threading.Lock()
+
+# Failure-based Rate Limiter State
+fail_tracker = {}
+fail_lock = threading.Lock()
+PENALTY_COOLDOWN = 10.0 # block for 10 seconds after failures
+MAX_FAILURES = 5
+
+
+def is_ip_rate_limited(ip: str) -> bool:
+    """Check if the IP is blocked due to too many recent failures."""
+    with fail_lock:
+        fail_count, last_fail_time = fail_tracker.get(ip, (0, 0.0))
+        if fail_count >= MAX_FAILURES:
+            # Check if cooldown has elapsed
+            if time.time() - last_fail_time < PENALTY_COOLDOWN:
+                return True
+            else:
+                # Cooldown elapsed, reset failures
+                fail_tracker[ip] = (0, 0.0)
+        return False
+
+
+def record_failure(ip: str):
+    """Record a failed handshake/authentication attempt."""
+    with fail_lock:
+        fail_count, _ = fail_tracker.get(ip, (0, 0.0))
+        fail_tracker[ip] = (fail_count + 1, time.time())
+        logging.warning("Failure recorded for %s (count=%d/%d)", ip, fail_count + 1, MAX_FAILURES)
+
+
+def record_success(ip: str):
+    """Reset the failure count on successful authentication."""
+    with fail_lock:
+        if ip in fail_tracker:
+            fail_tracker[ip] = (0, 0.0)
 
 
 def get_persisted_counter(device_id: str) -> int:
@@ -104,10 +139,9 @@ def handle_client(conn, addr, args, hop_epoch):
     peer_ip = addr[0]
     conn.settimeout(10.0)
 
-    # -- Rate limiting (per IP) -------------------------------------------
-    limiter = get_rate_limiter(peer_ip)
-    if not limiter.consume():
-        logging.warning("Rate limit exceeded for %s - dropping connection", peer_ip)
+    # -- Failure-based Rate Limiting --------------------------------------
+    if is_ip_rate_limited(peer_ip):
+        logging.warning("Connection dropped: IP %s is temporarily blocked due to too many failed attempts.", peer_ip)
         try:
             send_framed(conn, b"RATE_LIMITED")
         except Exception:
@@ -118,22 +152,30 @@ def handle_client(conn, addr, args, hop_epoch):
     if MASTER_KEY is None:
         MASTER_KEY = load_master_key()
 
-    active_port, _ = derive_hop_port_and_freq(MASTER_KEY, hop_epoch)
-    logging.info("Connection received from %s (port=%d)", peer_ip, active_port)
+    logging.info("Connection received from %s", peer_ip)
 
     try:
-        _handle_authenticated_session(conn, addr, args, limiter, active_port)
+        success = _handle_authenticated_session(conn, addr, args, active_port=None, hop_epoch=hop_epoch)
+        if success:
+            record_success(peer_ip)
+        else:
+            record_failure(peer_ip)
     except (ConnectionError, ValueError, TimeoutError) as exc:
         logging.error("Session error from %s: %s", peer_ip, exc)
+        record_failure(peer_ip)
     finally:
         conn.close()
 
 
-def _handle_authenticated_session(conn, addr, args, limiter, active_port):
+def _handle_authenticated_session(conn, addr, args, active_port, hop_epoch):
     """Run the full handshake + message loop for one connection."""
     global seen_nonces
 
     epoch = int(time.time()) // args.key_rotation_period
+    
+    # Calculate active port if not passed (used for logging success)
+    if active_port is None:
+        active_port, _ = derive_hop_port_and_freq(MASTER_KEY, hop_epoch)
 
     # -- Step 1: receive HELLO --------------------------------------------
     hello_data = recv_framed(conn)
@@ -257,14 +299,6 @@ def _handle_authenticated_session(conn, addr, args, limiter, active_port):
     attempts       = 0
 
     while attempts < args.max_attempts:
-
-        # Rate-limit check on each message too
-        if not limiter.consume():
-            logging.warning("Rate limit exceeded mid-session for %s", addr[0])
-            send_framed(conn, b"RATE_LIMITED")
-            attempts += 1
-            continue
-
         pkt = recv_framed(conn)
         if not pkt:
             break
@@ -358,9 +392,10 @@ def _handle_authenticated_session(conn, addr, args, limiter, active_port):
             active_port,
         )
         send_framed(conn, f"STATE:{new_state}".encode())
-        return
+        return True
 
     logging.warning("Max attempts exhausted from %s - closing", addr[0])
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -404,7 +439,6 @@ def run_server(args):
             # Close sockets for expired epochs
             for epoch in list(current_sockets.keys()):
                 if epoch not in epochs_to_listen:
-                    # Log as debug to keep terminal interface clean
                     logging.debug("Closing listener socket for expired hop_epoch %d", epoch)
                     sock = current_sockets.pop(epoch)
                     try:
@@ -416,7 +450,6 @@ def run_server(args):
             for epoch in epochs_to_listen:
                 if epoch not in current_sockets:
                     port, freq_idx = derive_hop_port_and_freq(MASTER_KEY, epoch)
-                    # Log as debug to keep terminal interface clean
                     logging.debug("Binding listener for hop_epoch %d to port %d (freq_idx %d)", epoch, port, freq_idx)
                     try:
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
