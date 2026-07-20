@@ -229,79 +229,86 @@ def run_tx(args):
         logging.error("Failed to connect to receiver. Check if the receiver is running.")
         return
 
-    with s:
-        s.settimeout(10.0)
-        keys = mutual_auth(s, master_key, epoch)
-        if not keys:
-            logging.error("Mutual authentication failed - aborting")
-            return
-        logging.info("Secure connection established")
-
-        tx_counter = get_persisted_counter()
-        fhss_index = 0
-        retry_delay = args.retry_delay
-
-        for attempt in range(1, args.max_attempts + 1):
-            code     = rolling_code_from_counter(keys["roll"], tx_counter)
-            _, f_idx = fhss_for_index(keys["fhss"], args.frequencies, fhss_index)
-
-            # Plaintext layout:
-            #   [0:6]   rolling code (ASCII decimal, zero-padded)
-            #   [6:10]  frequency list index (4-byte big-endian)
-            #   [10:14] fhss_index / hop counter (4-byte big-endian)
-            plaintext = (
-                f"{code:06d}".encode()
-                + f_idx.to_bytes(4, "big")
-                + fhss_index.to_bytes(4, "big")
-            )
-
-            nonce, ciphertext = aead_encrypt(keys["aead"], PROT_VERSION, plaintext)
-
-            pkt = b"|".join([
-                b"MSG",
-                nonce.hex().encode(),
-                ciphertext.hex().encode(),
-            ])
-            send_framed(s, pkt)
-
-            response = recv_framed(s)
-
-            if response.startswith(b"STATE:"):
-                new_state = response.split(b":")[1].decode()
-                freq_mhz = args.frequencies[f_idx] if f_idx < len(args.frequencies) else 902
-                logging.info(
-                    "SUCCESS: Car state is now -> %s (attempt %d | counter=%d | hop=%d | freq_idx=%d | freq=%d MHz | port=%d)",
-                    new_state,
-                    attempt,
-                    tx_counter,
-                    fhss_index,
-                    f_idx,
-                    freq_mhz,
-                    connected_port,
-                )
-                # Advance counter and persist
-                tx_counter += 1
-                save_persisted_counter(tx_counter)
+    try:
+        with s:
+            s.settimeout(10.0)
+            keys = mutual_auth(s, master_key, epoch)
+            if not keys:
+                logging.error("Mutual authentication failed - aborting")
                 return
+            logging.info("Secure connection established")
 
-            if response == b"RATE_LIMITED":
-                # Back off when the receiver signals rate limiting
-                retry_delay = min(retry_delay * 2, 30.0)
-                logging.warning(
-                    "Rate limited by receiver - backing off to %.1fs", retry_delay
+            tx_counter = get_persisted_counter()
+            fhss_index = 0
+            retry_delay = args.retry_delay
+
+            for attempt in range(1, args.max_attempts + 1):
+                code     = rolling_code_from_counter(keys["roll"], tx_counter)
+                _, f_idx = fhss_for_index(keys["fhss"], args.frequencies, fhss_index)
+
+                # Plaintext layout:
+                #   [0:6]   rolling code (ASCII decimal, zero-padded)
+                #   [6:10]  frequency list index (4-byte big-endian)
+                #   [10:14] fhss_index / hop counter (4-byte big-endian)
+                plaintext = (
+                    f"{code:06d}".encode()
+                    + f_idx.to_bytes(4, "big")
+                    + fhss_index.to_bytes(4, "big")
                 )
-            elif response == b"LOCKED":
-                retry_delay = args.retry_delay   # reset on normal rejection
-            else:
-                logging.warning("Unknown response: %r", response)
 
-            tx_counter += 1
-            fhss_index += 1
-            time.sleep(retry_delay)
+                nonce, ciphertext = aead_encrypt(keys["aead"], PROT_VERSION, plaintext)
 
-        # Even on exhaustion/failure, save the latest counter progression
-        save_persisted_counter(tx_counter)
-        logging.warning("Max attempts reached - giving up")
+                pkt = b"|".join([
+                    b"MSG",
+                    nonce.hex().encode(),
+                    ciphertext.hex().encode(),
+                ])
+                
+                try:
+                    send_framed(s, pkt)
+                    response = recv_framed(s)
+                except ConnectionError:
+                    logging.error("Connection aborted by receiver (likely due to rate limiting). Please wait 10 seconds and try again.")
+                    save_persisted_counter(tx_counter)
+                    return
+
+                if response.startswith(b"STATE:"):
+                    new_state = response.split(b":")[1].decode()
+                    logging.info(
+                        "SUCCESS: Car state is now -> %s (attempt %d | counter=%d | hop=%d | freq_idx=%d | freq=%d MHz | port=%d)",
+                        new_state,
+                        attempt,
+                        tx_counter,
+                        fhss_index,
+                        f_idx,
+                        args.frequencies[f_idx] if f_idx < len(args.frequencies) else 902,
+                        connected_port,
+                    )
+                    # Advance counter and persist
+                    tx_counter += 1
+                    save_persisted_counter(tx_counter)
+                    return
+
+                if response == b"RATE_LIMITED":
+                    # Back off when the receiver signals rate limiting
+                    retry_delay = min(retry_delay * 2, 30.0)
+                    logging.warning(
+                        "Rate limited by receiver - backing off to %.1fs", retry_delay
+                    )
+                elif response == b"LOCKED":
+                    retry_delay = args.retry_delay   # reset on normal rejection
+                else:
+                    logging.warning("Unknown response: %r", response)
+
+                tx_counter += 1
+                fhss_index += 1
+                time.sleep(retry_delay)
+
+            # Even on exhaustion/failure, save the latest counter progression
+            save_persisted_counter(tx_counter)
+            logging.warning("Max attempts reached - giving up")
+    except ConnectionError:
+        logging.error("Connection forcibly closed by receiver (likely due to rate limiting). Please wait 10 seconds.")
 
 
 # ---------------------------------------------------------------------------
