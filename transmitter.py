@@ -15,6 +15,8 @@ Improvements applied vs original:
   9. Dynamic Port Hopping     : client determines active port using master key & time epoch (5s epoch).
   10. Counter Persistence      : counter saved to transmitter_state.json across restarts.
   11. Encrypted Device ID      : device ID exchanged securely under derived AEAD key.
+  12. Toggle State             : processes STATE:LOCKED or STATE:UNLOCKED toggles from the car.
+  13. Clean UI                 : simplified logging format and suppressed debugging logs in standard output.
 """
 
 import os
@@ -104,7 +106,6 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
         mac1.hex().encode(),
     ])
     send_framed(sock, hello_payload)
-    logging.debug("TX -> RX : HELLO sent")
 
     # -- Step 3: receive ACK ----------------------------------------------
     ack_data = recv_framed(sock)
@@ -127,7 +128,6 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
     if not verify_peer_pub_key(pub_rx, nonce_rx, sig_rx):
         logging.error("RX pub key certificate validation FAILED")
         return None
-    logging.info("RX certificate validated")
 
     # -- Step 5: verify master-key HMAC on ACK ---------------------------
     expected_mac2 = hmac_bytes(
@@ -146,7 +146,6 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
         salt=nonce_tx + nonce_rx,
         epoch=epoch,
     )
-    logging.info("Session keys derived (epoch=%d)", epoch)
 
     # -- Step 7: send FIN + device attestation (encrypting Device ID) ---
     session_nonce = nonce_tx + nonce_rx
@@ -165,7 +164,6 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
         enc_nonce.hex().encode(),
     ])
     send_framed(sock, fin_payload)
-    logging.debug("TX -> RX : FIN + attestation sent")
 
     # -- Step 8: receive OK + RX attestation -----------------------------
     ok_data = recv_framed(sock)
@@ -194,10 +192,6 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
     if not verify_attestation(keys["mac"], rx_device_id, session_nonce, attest_rx):
         logging.error("RX device attestation FAILED - possible MITM")
         return None
-    logging.info(
-        "RX device attestation verified (device_id=%s)",
-        rx_device_id.decode(errors="replace"),
-    )
 
     return keys
 
@@ -208,10 +202,8 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
 
 def run_tx(args):
     master_key = load_master_key()
-    logging.info("Master key loaded")
 
     epoch = int(time.time()) // args.key_rotation_period
-    logging.info("Key-rotation epoch: %d", epoch)
 
     epoch_now = get_hop_epoch(5)
     s = None
@@ -222,21 +214,19 @@ def run_tx(args):
     for epoch_offset in (0, -1, 1):
         target_epoch = epoch_now + epoch_offset
         port, freq_idx = derive_hop_port_and_freq(master_key, target_epoch)
-        logging.info("Attempting connection to receiver on port %d (freq_idx %d, hop_epoch %d)...", port, freq_idx, target_epoch)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(2.0)
+            sock.settimeout(1.5)
             sock.connect((args.host, port))
             s = sock
             connected_port = port
             connected_epoch = target_epoch
-            logging.info("Connected successfully to port %d", port)
             break
         except Exception:
             pass
 
     if not s:
-        logging.error("Failed to connect to receiver on any dynamic ports. Aborting.")
+        logging.error("Failed to connect to receiver. Check if the receiver is running.")
         return
 
     with s:
@@ -245,7 +235,7 @@ def run_tx(args):
         if not keys:
             logging.error("Mutual authentication failed - aborting")
             return
-        logging.info("Mutual authentication complete")
+        logging.info("Secure connection established")
 
         tx_counter = get_persisted_counter()
         fhss_index = 0
@@ -273,15 +263,12 @@ def run_tx(args):
                 ciphertext.hex().encode(),
             ])
             send_framed(s, pkt)
-            logging.debug(
-                "Attempt %d/%d | counter=%d | hop=%d | freq_idx=%d",
-                attempt, args.max_attempts, tx_counter, fhss_index, f_idx,
-            )
 
             response = recv_framed(s)
 
-            if response == b"UNLOCKED":
-                logging.info("CAR UNLOCKED (attempt %d)", attempt)
+            if response.startswith(b"STATE:"):
+                new_state = response.split(b":")[1].decode()
+                logging.info("SUCCESS: Car state is now -> %s", new_state)
                 # Advance counter and persist
                 tx_counter += 1
                 save_persisted_counter(tx_counter)
@@ -295,7 +282,6 @@ def run_tx(args):
                 )
             elif response == b"LOCKED":
                 retry_delay = args.retry_delay   # reset on normal rejection
-                logging.debug("Attempt %d rejected (LOCKED)", attempt)
             else:
                 logging.warning("Unknown response: %r", response)
 
@@ -330,8 +316,8 @@ def parse_args():
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s | TX | %(levelname)s | %(message)s",
+        level=logging.INFO,
+        format="%(asctime)s | TX | %(message)s",
         force=True,
     )
     run_tx(parse_args())

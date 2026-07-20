@@ -16,6 +16,8 @@ Improvements applied vs original:
   11. Global Nonce Cache      : thread-safe global set protects against multi-session replays.
   12. Clock Skew Tolerance    : checks adjacent key-rotation epochs to avoid DoS on boundaries.
   13. Multi-threaded Server    : concurrent handling of client connections prevents blocking.
+  14. Toggle State (Lock/Unlock): toggles between LOCKED and UNLOCKED states upon valid command.
+  15. Clean UI                 : suppressed recurring bind/close statements in standard log output.
 """
 
 import os
@@ -81,6 +83,17 @@ def save_persisted_counter(device_id: str, counter: int) -> None:
         save_state_file(STATE_FILE, state)
 
 
+def toggle_car_state() -> str:
+    """Toggle the persistent state of the car between LOCKED and UNLOCKED."""
+    with state_lock:
+        state = load_state_file(STATE_FILE)
+        current = state.get("car_state", "LOCKED")
+        new_state = "UNLOCKED" if current == "LOCKED" else "LOCKED"
+        state["car_state"] = new_state
+        save_state_file(STATE_FILE, state)
+        return new_state
+
+
 # ---------------------------------------------------------------------------
 # Per-connection handler
 # ---------------------------------------------------------------------------
@@ -105,7 +118,7 @@ def handle_client(conn, addr, args, hop_epoch):
     if MASTER_KEY is None:
         MASTER_KEY = load_master_key()
 
-    logging.info("Connection from %s:%d (hop_epoch=%d)", peer_ip, addr[1], hop_epoch)
+    logging.info("Connection received from %s", peer_ip)
 
     try:
         _handle_authenticated_session(conn, addr, args, limiter)
@@ -140,7 +153,6 @@ def _handle_authenticated_session(conn, addr, args, limiter):
     if not verify_peer_pub_key(pub_tx, nonce_tx, sig_tx):
         logging.error("TX pub key certificate validation FAILED from %s", addr[0])
         raise ValueError("TX certificate invalid")
-    logging.info("TX certificate validated")
 
     # -- Step 3: verify master-key HMAC on HELLO --------------------------
     if not _hmac.compare_digest(
@@ -149,8 +161,6 @@ def _handle_authenticated_session(conn, addr, args, limiter):
     ):
         logging.error("HELLO master-key MAC invalid from %s", addr[0])
         raise ValueError("HELLO MAC invalid")
-
-    logging.info("HELLO verified")
 
     # -- Step 4: generate RX ephemeral key pair + sign it -----------------
     priv_rx, pub_rx = make_x25519_keypair()
@@ -170,7 +180,6 @@ def _handle_authenticated_session(conn, addr, args, limiter):
         mac2.hex().encode(),
     ])
     send_framed(conn, ack_payload)
-    logging.debug("RX -> TX : ACK sent")
 
     # -- Step 5: derive session keys --------------------------------------
     peer_pub = load_peer_pub(pub_tx)
@@ -203,7 +212,6 @@ def _handle_authenticated_session(conn, addr, args, limiter):
         expected_fin_mac = hmac_bytes(candidate_keys["mac"], b"FIN")
         if _hmac.compare_digest(expected_fin_mac, fin_mac):
             keys = candidate_keys
-            logging.info("Session keys derived (epoch=%d, skew_offset=%d)", candidate_epoch, epoch_offset)
             break
 
     if not keys:
@@ -223,7 +231,7 @@ def _handle_authenticated_session(conn, addr, args, limiter):
         logging.error("TX device attestation FAILED from %s", addr[0])
         raise ValueError("TX attestation invalid")
     logging.info(
-        "TX device attestation verified (device_id=%s)",
+        "Device authenticated successfully (device_id=%s)",
         tx_device_id.decode(errors="replace"),
     )
 
@@ -239,10 +247,8 @@ def _handle_authenticated_session(conn, addr, args, limiter):
         enc_rx_nonce.hex().encode(),
     ])
     send_framed(conn, ok_payload)
-    logging.debug("RX -> TX : OK + attestation sent")
 
     # -- Step 8: message loop ---------------------------------------------
-    fhss_index     = 0
     tx_device_id_str = tx_device_id.decode(errors="replace")
     
     # Load counter dynamically from persistent state
@@ -337,15 +343,16 @@ def _handle_authenticated_session(conn, addr, args, limiter):
             attempts += 1
             continue
 
-        # ── All checks passed → UNLOCK ───────────────────────────────────
+        # -- All checks passed -> Toggle State and return response --------
+        new_state = toggle_car_state()
         logging.info(
-            "🔓 CAR UNLOCKED | device=%s | hop=%d | counter=%d",
+            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d]",
+            new_state,
             tx_device_id_str,
             hop_idx,
             matched_counter,
         )
-
-        send_framed(conn, b"UNLOCKED")
+        send_framed(conn, f"STATE:{new_state}".encode())
         return
 
     logging.warning("Max attempts exhausted from %s - closing", addr[0])
@@ -379,7 +386,7 @@ def run_server(args):
     if MASTER_KEY is None:
         MASTER_KEY = load_master_key()
 
-    logging.info("Receiver starting with dynamic port/frequency hopping (period=5s)...")
+    logging.info("Receiver listening and active. Dynamic port-hopping active (5s window)...")
     
     current_sockets = {}  # hop_epoch -> socket
     
@@ -392,6 +399,7 @@ def run_server(args):
             # Close sockets for expired epochs
             for epoch in list(current_sockets.keys()):
                 if epoch not in epochs_to_listen:
+                    # Log as debug to keep terminal interface clean
                     logging.debug("Closing listener socket for expired hop_epoch %d", epoch)
                     sock = current_sockets.pop(epoch)
                     try:
@@ -403,7 +411,8 @@ def run_server(args):
             for epoch in epochs_to_listen:
                 if epoch not in current_sockets:
                     port, freq_idx = derive_hop_port_and_freq(MASTER_KEY, epoch)
-                    logging.info("Binding listener for hop_epoch %d to port %d (freq_idx %d)", epoch, port, freq_idx)
+                    # Log as debug to keep terminal interface clean
+                    logging.debug("Binding listener for hop_epoch %d to port %d (freq_idx %d)", epoch, port, freq_idx)
                     try:
                         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -419,7 +428,7 @@ def run_server(args):
                         )
                         t.start()
                     except Exception as e:
-                        logging.error("Failed to bind hop_epoch %d to port %d: %s", epoch, port, e)
+                        logging.debug("Failed to bind hop_epoch %d to port %d: %s", epoch, port, e)
             
             time.sleep(1.0)
     except KeyboardInterrupt:
@@ -452,8 +461,8 @@ def parse_args():
 
 if __name__ == "__main__":
     logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s | RX | %(levelname)s | %(message)s",
+        level=logging.INFO,
+        format="%(asctime)s | RX | %(message)s",
         force=True,
     )
     run_server(parse_args())
