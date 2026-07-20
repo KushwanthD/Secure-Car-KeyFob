@@ -346,11 +346,12 @@ def _handle_authenticated_session(conn, addr, args, limiter):
         # -- All checks passed -> Toggle State and return response --------
         new_state = toggle_car_state()
         logging.info(
-            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d]",
+            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d | freq_idx=%d]",
             new_state,
             tx_device_id_str,
             hop_idx,
             matched_counter,
+            freq_index,
         )
         send_framed(conn, f"STATE:{new_state}".encode())
         return

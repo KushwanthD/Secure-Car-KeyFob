@@ -268,7 +268,14 @@ def run_tx(args):
 
             if response.startswith(b"STATE:"):
                 new_state = response.split(b":")[1].decode()
-                logging.info("SUCCESS: Car state is now -> %s", new_state)
+                logging.info(
+                    "SUCCESS: Car state is now -> %s (attempt %d | counter=%d | hop=%d | freq_idx=%d)",
+                    new_state,
+                    attempt,
+                    tx_counter,
+                    fhss_index,
+                    f_idx,
+                )
                 # Advance counter and persist
                 tx_counter += 1
                 save_persisted_counter(tx_counter)
