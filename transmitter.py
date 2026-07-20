@@ -268,13 +268,16 @@ def run_tx(args):
 
             if response.startswith(b"STATE:"):
                 new_state = response.split(b":")[1].decode()
+                freq_mhz = args.frequencies[f_idx] if f_idx < len(args.frequencies) else 902
                 logging.info(
-                    "SUCCESS: Car state is now -> %s (attempt %d | counter=%d | hop=%d | freq_idx=%d)",
+                    "SUCCESS: Car state is now -> %s (attempt %d | counter=%d | hop=%d | freq_idx=%d | freq=%d MHz | port=%d)",
                     new_state,
                     attempt,
                     tx_counter,
                     fhss_index,
                     f_idx,
+                    freq_mhz,
+                    connected_port,
                 )
                 # Advance counter and persist
                 tx_counter += 1

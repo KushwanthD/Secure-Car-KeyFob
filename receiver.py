@@ -118,17 +118,18 @@ def handle_client(conn, addr, args, hop_epoch):
     if MASTER_KEY is None:
         MASTER_KEY = load_master_key()
 
-    logging.info("Connection received from %s", peer_ip)
+    active_port, _ = derive_hop_port_and_freq(MASTER_KEY, hop_epoch)
+    logging.info("Connection received from %s (port=%d)", peer_ip, active_port)
 
     try:
-        _handle_authenticated_session(conn, addr, args, limiter)
+        _handle_authenticated_session(conn, addr, args, limiter, active_port)
     except (ConnectionError, ValueError, TimeoutError) as exc:
         logging.error("Session error from %s: %s", peer_ip, exc)
     finally:
         conn.close()
 
 
-def _handle_authenticated_session(conn, addr, args, limiter):
+def _handle_authenticated_session(conn, addr, args, limiter, active_port):
     """Run the full handshake + message loop for one connection."""
     global seen_nonces
 
@@ -345,13 +346,16 @@ def _handle_authenticated_session(conn, addr, args, limiter):
 
         # -- All checks passed -> Toggle State and return response --------
         new_state = toggle_car_state()
+        freq_mhz = args.frequencies[freq_index] if freq_index < len(args.frequencies) else 902
         logging.info(
-            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d | freq_idx=%d]",
+            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d | freq_idx=%d | freq=%d MHz | port=%d]",
             new_state,
             tx_device_id_str,
             hop_idx,
             matched_counter,
             freq_index,
+            freq_mhz,
+            active_port,
         )
         send_framed(conn, f"STATE:{new_state}".encode())
         return
