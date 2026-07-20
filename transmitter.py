@@ -1,17 +1,20 @@
 """
-transmitter.py — Key-fob transmitter (TX side).
+transmitter.py - Key-fob transmitter (TX side).
 
 Improvements applied vs original:
-  ① Certificate validation  : TX signs its X25519 pub with Ed25519 identity key;
+  1. Certificate validation  : TX signs its X25519 pub with Ed25519 identity key;
                                verifies RX's Ed25519 signature before trusting its pub.
-  ② Rate limiting           : TX backs off when the receiver signals rate-limit rejection.
-  ③ Key rotation            : Session keys incorporate a daily epoch so they auto-rotate.
-  ④ Device attestation      : TX sends a session-bound HMAC attestation tag after FIN
+  2. Rate limiting           : TX backs off when the receiver signals rate-limit rejection.
+  3. Key rotation            : Session keys incorporate a daily epoch so they auto-rotate.
+  4. Device attestation      : TX sends a session-bound HMAC attestation tag after FIN
                                and verifies the RX's attestation before sending any MSG.
-  ⑤ Rolling code verified   : TX packs the code; RX now also checks it (see receiver).
-  ⑥ Counter desync window   : TX tracks its counter; RX uses verify_rolling_code_with_window.
-  ⑦ HKDF salt fix           : salt = nonce_tx+nonce_rx; info = domain label.
-  ⑧ TCP framing fix         : all messages use send_framed / recv_framed.
+  5. Rolling code verified   : TX packs the code; RX now also checks it (see receiver).
+  6. Counter desync window   : TX tracks its counter; RX uses verify_rolling_code_with_window.
+  7. HKDF salt fix           : salt = nonce_tx+nonce_rx; info = domain label.
+  8. TCP framing fix         : all messages use send_framed / recv_framed.
+  9. Dynamic Port Hopping     : client determines active port using master key & time epoch (5s epoch).
+  10. Counter Persistence      : counter saved to transmitter_state.json across restarts.
+  11. Encrypted Device ID      : device ID exchanged securely under derived AEAD key.
 """
 
 import os
@@ -30,6 +33,7 @@ from common_fix import (
     load_peer_pub,
     derive_session_keys_with_rotation,
     aead_encrypt,
+    aead_decrypt,
     hmac_bytes,
     fhss_for_index,
     rolling_code_from_counter,
@@ -40,30 +44,48 @@ from common_fix import (
     verify_attestation,
     send_framed,
     recv_framed,
+    get_hop_epoch,
+    derive_hop_port_and_freq,
+    load_state_file,
+    save_state_file,
 )
 
 PROT_VERSION = b"\x02"          # bumped from v1 to reflect the new handshake
+STATE_FILE = "transmitter_state.json"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+def get_persisted_counter() -> int:
+    """Read the last used transmitter counter from persistent storage."""
+    state = load_state_file(STATE_FILE)
+    return state.get("tx_counter", 0)
+
+
+def save_persisted_counter(counter: int) -> None:
+    """Save the transmitter counter to persistent storage."""
+    state = load_state_file(STATE_FILE)
+    state["tx_counter"] = counter
+    save_state_file(STATE_FILE, state)
+
+
+# ---------------------------------------------------------------------------
 # Handshake helpers
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
     """
     3-way authenticated key agreement:
 
-      TX → RX : HELLO  pub_tx  nonce_tx  sig_tx  mac1
-      RX → TX : ACK    pub_rx  nonce_rx  sig_rx  mac2
-      TX → RX : FIN    fin_mac  attest_tx  device_id_tx
-      RX → TX : OK     attest_rx  device_id_rx
+      TX -> RX : HELLO  pub_tx  nonce_tx  sig_tx  mac1
+      RX -> TX : ACK    pub_rx  nonce_rx  sig_rx  mac2
+      TX -> RX : FIN    fin_mac  attest_tx  enc_did_tx  enc_nonce_tx
+      RX -> TX : OK     attest_rx  enc_did_rx  enc_nonce_rx
 
-    sig_*  = Ed25519 signature over (pub || nonce)  — certificate validation
+    sig_*  = Ed25519 signature over (pub || nonce) - certificate validation
     mac*   = HMAC-SHA256(master_key, role || pub_tx || nonce_tx || pub_rx || nonce_rx)
     attest = HMAC-SHA256(session_mac_key, "ATTEST" || device_id || session_nonce)
     """
 
-    # ── Step 1: generate ephemeral X25519 key pair ──────────────────────
+    # -- Step 1: generate ephemeral X25519 key pair ----------------------
     priv_tx, pub_tx = make_x25519_keypair()
     nonce_tx        = os.urandom(16)
 
@@ -73,7 +95,7 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
     # HMAC over (HELLO || pub_tx || nonce_tx) with master key
     mac1 = hmac_bytes(master_key, b"HELLO" + pub_tx + nonce_tx)
 
-    # ── Step 2: send HELLO ───────────────────────────────────────────────
+    # -- Step 2: send HELLO -----------------------------------------------
     hello_payload = b"|".join([
         b"HELLO",
         pub_tx.hex().encode(),
@@ -82,9 +104,9 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
         mac1.hex().encode(),
     ])
     send_framed(sock, hello_payload)
-    logging.debug("TX → RX : HELLO sent")
+    logging.debug("TX -> RX : HELLO sent")
 
-    # ── Step 3: receive ACK ──────────────────────────────────────────────
+    # -- Step 3: receive ACK ----------------------------------------------
     ack_data = recv_framed(sock)
     if not ack_data.startswith(b"ACK|"):
         logging.error("Unexpected response to HELLO: %r", ack_data[:20])
@@ -101,13 +123,13 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
     sig_rx   = bytes.fromhex(sig_rx_hex.decode())
     mac2     = bytes.fromhex(mac2_hex.decode())
 
-    # ── Step 4: certificate validation — verify RX's Ed25519 signature ──
+    # -- Step 4: certificate validation - verify RX's Ed25519 signature --
     if not verify_peer_pub_key(pub_rx, nonce_rx, sig_rx):
         logging.error("RX pub key certificate validation FAILED")
         return None
-    logging.info("RX certificate validated ✓")
+    logging.info("RX certificate validated")
 
-    # ── Step 5: verify master-key HMAC on ACK ───────────────────────────
+    # -- Step 5: verify master-key HMAC on ACK ---------------------------
     expected_mac2 = hmac_bytes(
         master_key,
         b"ACK" + pub_rx + nonce_rx + pub_tx + nonce_tx,
@@ -116,7 +138,7 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
         logging.error("ACK master-key MAC verification FAILED")
         return None
 
-    # ── Step 6: derive session keys (with epoch-based rotation) ─────────
+    # -- Step 6: derive session keys (with epoch-based rotation) ---------
     peer_pub = load_peer_pub(pub_rx)
     shared   = priv_tx.exchange(peer_pub)
     keys     = derive_session_keys_with_rotation(
@@ -124,73 +146,108 @@ def mutual_auth(sock, master_key: bytes, epoch: int) -> dict | None:
         salt=nonce_tx + nonce_rx,
         epoch=epoch,
     )
-    logging.info("Session keys derived (epoch=%d) ✓", epoch)
+    logging.info("Session keys derived (epoch=%d)", epoch)
 
-    # ── Step 7: send FIN + device attestation ───────────────────────────
+    # -- Step 7: send FIN + device attestation (encrypting Device ID) ---
     session_nonce = nonce_tx + nonce_rx
     device_id     = get_device_id()
     fin_mac       = hmac_bytes(keys["mac"], b"FIN")
     attest_tx     = sign_attestation(keys["mac"], device_id, session_nonce)
 
+    # Encrypt the Device ID to prevent privacy leak
+    enc_nonce, enc_did = aead_encrypt(keys["aead"], b"TX_DID", device_id)
+
     fin_payload = b"|".join([
         b"FIN",
         fin_mac.hex().encode(),
         attest_tx.hex().encode(),
-        device_id.hex().encode(),
+        enc_did.hex().encode(),
+        enc_nonce.hex().encode(),
     ])
     send_framed(sock, fin_payload)
-    logging.debug("TX → RX : FIN + attestation sent")
+    logging.debug("TX -> RX : FIN + attestation sent")
 
-    # ── Step 8: receive OK + RX attestation ─────────────────────────────
+    # -- Step 8: receive OK + RX attestation -----------------------------
     ok_data = recv_framed(sock)
     if not ok_data.startswith(b"OK|"):
         logging.error("Expected OK, got: %r", ok_data[:20])
         return None
 
     ok_parts = ok_data.split(b"|")
-    if len(ok_parts) != 3:
+    if len(ok_parts) != 4:
         logging.error("Malformed OK frame")
         return None
 
-    _, attest_rx_hex, rx_device_id_hex = ok_parts
+    _, attest_rx_hex, enc_rx_did_hex, enc_rx_nonce_hex = ok_parts
     attest_rx    = bytes.fromhex(attest_rx_hex.decode())
-    rx_device_id = bytes.fromhex(rx_device_id_hex.decode())
+    enc_rx_did   = bytes.fromhex(enc_rx_did_hex.decode())
+    enc_rx_nonce = bytes.fromhex(enc_rx_nonce_hex.decode())
 
-    # ── Step 9: verify RX device attestation ────────────────────────────
+    # Decrypt RX Device ID
+    try:
+        rx_device_id = aead_decrypt(keys["aead"], b"RX_DID", enc_rx_nonce, enc_rx_did)
+    except Exception:
+        logging.error("Failed to decrypt RX device ID")
+        return None
+
+    # -- Step 9: verify RX device attestation ----------------------------
     if not verify_attestation(keys["mac"], rx_device_id, session_nonce, attest_rx):
-        logging.error("RX device attestation FAILED — possible MITM")
+        logging.error("RX device attestation FAILED - possible MITM")
         return None
     logging.info(
-        "RX device attestation verified ✓  (device_id=%s)",
+        "RX device attestation verified (device_id=%s)",
         rx_device_id.decode(errors="replace"),
     )
 
     return keys
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # Main TX loop
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 def run_tx(args):
     master_key = load_master_key()
-    logging.info("Master key loaded ✓")
+    logging.info("Master key loaded")
 
     epoch = int(time.time()) // args.key_rotation_period
     logging.info("Key-rotation epoch: %d", epoch)
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(10.0)
-        s.connect((args.host, args.port))
-        logging.info("Connected to receiver %s:%d", args.host, args.port)
+    epoch_now = get_hop_epoch(5)
+    s = None
+    connected_port = None
+    connected_epoch = None
 
+    # Try connecting to the current, previous, or next hop epoch port to accommodate clock skew
+    for epoch_offset in (0, -1, 1):
+        target_epoch = epoch_now + epoch_offset
+        port, freq_idx = derive_hop_port_and_freq(master_key, target_epoch)
+        logging.info("Attempting connection to receiver on port %d (freq_idx %d, hop_epoch %d)...", port, freq_idx, target_epoch)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect((args.host, port))
+            s = sock
+            connected_port = port
+            connected_epoch = target_epoch
+            logging.info("Connected successfully to port %d", port)
+            break
+        except Exception:
+            pass
+
+    if not s:
+        logging.error("Failed to connect to receiver on any dynamic ports. Aborting.")
+        return
+
+    with s:
+        s.settimeout(10.0)
         keys = mutual_auth(s, master_key, epoch)
         if not keys:
-            logging.error("Mutual authentication failed — aborting")
+            logging.error("Mutual authentication failed - aborting")
             return
-        logging.info("Mutual authentication complete ✓")
+        logging.info("Mutual authentication complete")
 
-        tx_counter = 0
+        tx_counter = get_persisted_counter()
         fhss_index = 0
         retry_delay = args.retry_delay
 
@@ -224,14 +281,17 @@ def run_tx(args):
             response = recv_framed(s)
 
             if response == b"UNLOCKED":
-                logging.info("🔓 CAR UNLOCKED (attempt %d)", attempt)
+                logging.info("CAR UNLOCKED (attempt %d)", attempt)
+                # Advance counter and persist
+                tx_counter += 1
+                save_persisted_counter(tx_counter)
                 return
 
             if response == b"RATE_LIMITED":
                 # Back off when the receiver signals rate limiting
                 retry_delay = min(retry_delay * 2, 30.0)
                 logging.warning(
-                    "Rate limited by receiver — backing off to %.1fs", retry_delay
+                    "Rate limited by receiver - backing off to %.1fs", retry_delay
                 )
             elif response == b"LOCKED":
                 retry_delay = args.retry_delay   # reset on normal rejection
@@ -243,17 +303,18 @@ def run_tx(args):
             fhss_index += 1
             time.sleep(retry_delay)
 
-        logging.warning("Max attempts reached — giving up")
+        # Even on exhaustion/failure, save the latest counter progression
+        save_persisted_counter(tx_counter)
+        logging.warning("Max attempts reached - giving up")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 # CLI
-# ═══════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(description="Key-fob transmitter")
     p.add_argument("--host",        default="127.0.0.1")
-    p.add_argument("--port",        type=int, default=65432)
     p.add_argument("--max-attempts",type=int, default=6)
     p.add_argument("--retry-delay", type=float, default=0.2,
                    help="Initial delay between attempts (seconds)")

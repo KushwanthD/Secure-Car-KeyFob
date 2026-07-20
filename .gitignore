@@ -27,3 +27,7 @@ ENV/
 .DS_Store?
 Thumbs.db
 ehthumbs.db
+
+# Local application state and temporary files
+*_state.json
+*.tmp

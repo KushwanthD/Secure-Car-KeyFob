@@ -400,3 +400,67 @@ def get_rate_limiter(ip: str) -> TokenBucket:
             # Allow burst of 5 attempts; refill 1 token every 10 seconds.
             _ip_buckets[ip] = TokenBucket(capacity=5, refill_rate=0.1)
         return _ip_buckets[ip]
+
+
+# ---------------------------------------------------------------------------
+# 13. TIME-SYNCHRONIZED PORT AND FREQUENCY HOPPING & STATE PERSISTENCE
+# ---------------------------------------------------------------------------
+
+def get_hop_epoch(period_seconds: int = 5) -> int:
+    """Return a time-based epoch integer used to synchronize port/frequency hopping."""
+    return int(time.time()) // period_seconds
+
+
+def derive_hop_port_and_freq(
+    master_key: bytes,
+    epoch: int,
+    port_start: int = 50000,
+    port_range: int = 1000,
+) -> tuple[int, int]:
+    """
+    Derive a deterministic listening port and frequency index from the master key and epoch.
+    Ensures sequential epoch combinations are non-repeating and mathematically unpredictable.
+    """
+    # Derive for current epoch
+    mac = hmac_bytes(master_key, b"PORT_FREQ_HOP" + epoch.to_bytes(8, "big"))
+    port_offset = int.from_bytes(mac[0:4], "big") % port_range
+    freq_index = int.from_bytes(mac[4:8], "big")
+
+    # Retrieve derivation for the previous epoch to check for repetition
+    prev_mac = hmac_bytes(master_key, b"PORT_FREQ_HOP" + (epoch - 1).to_bytes(8, "big"))
+    prev_port_offset = int.from_bytes(prev_mac[0:4], "big") % port_range
+    prev_freq_index = int.from_bytes(prev_mac[4:8], "big")
+
+    # If the current port/frequency combination matches the previous one, perturb it
+    if port_offset == prev_port_offset and freq_index == prev_freq_index:
+        perturbed_mac = hmac_bytes(master_key, b"PORT_FREQ_HOP_PERTURB" + epoch.to_bytes(8, "big"))
+        port_offset = (port_offset + int.from_bytes(perturbed_mac[0:4], "big")) % port_range
+        freq_index = freq_index ^ int.from_bytes(perturbed_mac[4:8], "big")
+
+    return port_start + port_offset, freq_index
+
+
+import json
+
+def load_state_file(path: str) -> dict:
+    """Safely load JSON state from disk, returning an empty dict if missing or corrupt."""
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_state_file(path: str, data: dict) -> None:
+    """Safely write JSON state to disk."""
+    try:
+        temp_path = path + ".tmp"
+        with open(temp_path, "w") as f:
+            json.dump(data, f, indent=2)
+        if os.path.exists(path):
+            os.remove(path)
+        os.rename(temp_path, path)
+    except Exception:
+        pass
