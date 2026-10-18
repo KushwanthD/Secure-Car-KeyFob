@@ -101,6 +101,56 @@ def record_success(ip: str):
             fail_tracker[ip] = (0, 0.0)
 
 
+# ---------------------------------------------------------------------------
+# Sentinel AI Threat Layer Integration (Failsafe Benchmark)
+# ---------------------------------------------------------------------------
+try:
+    from sentinel import get_sentinel
+    SENTINEL_AVAILABLE = True
+except Exception as _e:
+    SENTINEL_AVAILABLE = False
+    logging.debug("[SENTINEL] Sentinel AI layer not available: %s", _e)
+
+
+def evaluate_sentinel_telemetry(peer_ip: str, telemetry: dict):
+    """
+    Pass handshake session metadata to Sentinel AI threat monitor.
+    Failsafe guarantee: If Sentinel encounters an issue, cryptographic
+    flow proceeds completely unhindered.
+    """
+    if not SENTINEL_AVAILABLE:
+        return None
+    try:
+        sentinel = get_sentinel()
+        device_id = telemetry.get("device_id", peer_ip)
+        assessment = sentinel.evaluate_session(device_id, telemetry)
+        risk = assessment["risk_score"]
+        attack_type = assessment["attack_type"]
+        level = assessment["level"]
+
+        if level == "HIGH":
+            logging.warning(
+                "[SENTINEL ALERT] Threat Detected: %s (Risk: %.3f) | %s",
+                attack_type, risk, "; ".join(assessment["explanations"])
+            )
+            # Adaptively tighten defense: record penalty failure
+            record_failure(peer_ip)
+        elif level == "MEDIUM":
+            logging.warning(
+                "[SENTINEL WARN] Suspicious Pattern: %s (Risk: %.3f) | %s",
+                attack_type, risk, "; ".join(assessment["explanations"])
+            )
+        else:
+            logging.debug(
+                "[SENTINEL] Session within normal baseline (Risk: %.3f | Status: NORMAL)",
+                risk
+            )
+        return assessment
+    except Exception as exc:
+        logging.debug("[SENTINEL FAILSAFE] Error in Sentinel evaluation: %s", exc)
+        return None
+
+
 def get_persisted_counter(device_id: str) -> int:
     """Read the last verified counter for a given device ID from persistent storage."""
     with state_lock:
@@ -138,6 +188,7 @@ def handle_client(conn, addr, args, hop_epoch):
 
     peer_ip = addr[0]
     conn.settimeout(10.0)
+    t_start = time.perf_counter()
 
     # -- Failure-based Rate Limiting --------------------------------------
     if is_ip_rate_limited(peer_ip):
@@ -155,7 +206,7 @@ def handle_client(conn, addr, args, hop_epoch):
     logging.info("Connection received from %s", peer_ip)
 
     try:
-        success = _handle_authenticated_session(conn, addr, args, active_port=None, hop_epoch=hop_epoch)
+        success = _handle_authenticated_session(conn, addr, args, active_port=None, hop_epoch=hop_epoch, t_start=t_start)
         if success:
             record_success(peer_ip)
         else:
@@ -163,11 +214,21 @@ def handle_client(conn, addr, args, hop_epoch):
     except (ConnectionError, ValueError, TimeoutError) as exc:
         logging.error("Session error from %s: %s", peer_ip, exc)
         record_failure(peer_ip)
+        duration_ms = (time.perf_counter() - t_start) * 1000.0
+        fail_count, _ = fail_tracker.get(peer_ip, (1, 0.0))
+        evaluate_sentinel_telemetry(peer_ip, {
+            "device_id": "UNKNOWN",
+            "duration_ms": duration_ms,
+            "failure_rate": fail_count,
+            "counter_gap": 0,
+            "hop_count": 0,
+            "attempts_needed": 1,
+        })
     finally:
         conn.close()
 
 
-def _handle_authenticated_session(conn, addr, args, active_port, hop_epoch):
+def _handle_authenticated_session(conn, addr, args, active_port, hop_epoch, t_start=None):
     """Run the full handshake + message loop for one connection."""
     global seen_nonces
 
@@ -381,8 +442,25 @@ def _handle_authenticated_session(conn, addr, args, active_port, hop_epoch):
         # -- All checks passed -> Toggle State and return response --------
         new_state = toggle_car_state()
         freq_mhz = args.frequencies[freq_index] if freq_index < len(args.frequencies) else 902
+        
+        # Telemetry collection for Sentinel AI Layer
+        duration_ms = (time.perf_counter() - t_start) * 1000.0 if t_start else 15.0
+        fail_count, _ = fail_tracker.get(addr[0], (0, 0.0))
+        counter_gap = max(0, matched_counter - tx_counter + 1)
+        
+        telemetry = {
+            "device_id": tx_device_id_str,
+            "duration_ms": duration_ms,
+            "failure_rate": fail_count,
+            "counter_gap": counter_gap,
+            "hop_count": hop_idx,
+            "attempts_needed": attempts + 1,
+        }
+        assessment = evaluate_sentinel_telemetry(addr[0], telemetry)
+        sentinel_info = f" | sentinel={assessment['attack_type']} (risk={assessment['risk_score']:.2f})" if assessment else ""
+
         logging.info(
-            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d | freq_idx=%d | freq=%d MHz | port=%d]",
+            "SUCCESS: Car state toggled to %s [device=%s | hop=%d | counter=%d | freq_idx=%d | freq=%d MHz | port=%d%s]",
             new_state,
             tx_device_id_str,
             hop_idx,
@@ -390,11 +468,21 @@ def _handle_authenticated_session(conn, addr, args, active_port, hop_epoch):
             freq_index,
             freq_mhz,
             active_port,
+            sentinel_info,
         )
         send_framed(conn, f"STATE:{new_state}".encode())
         return True
 
     logging.warning("Max attempts exhausted from %s - closing", addr[0])
+    duration_ms = (time.perf_counter() - t_start) * 1000.0 if t_start else 15.0
+    evaluate_sentinel_telemetry(addr[0], {
+        "device_id": tx_device_id_str if 'tx_device_id_str' in locals() else addr[0],
+        "duration_ms": duration_ms,
+        "failure_rate": attempts,
+        "counter_gap": 0,
+        "hop_count": 0,
+        "attempts_needed": attempts,
+    })
     return False
 
 
